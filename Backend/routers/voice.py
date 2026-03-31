@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, UploadFile, File
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, UploadFile, File, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.db import get_db
 from services.voice_agent import VoiceAgentService, transcribe_audio, text_to_speech
+from fastapi.responses import Response
 from pydantic import BaseModel
 import uuid
 
@@ -14,9 +14,12 @@ class ChatRequest(BaseModel):
     message: str
 
 @router.post("/session/start")
-async def start_session(db: AsyncSession = Depends(get_db)):
+async def start_session(
+    patient_id: int = Query(None),   # ← Accept patient_id
+    db: AsyncSession = Depends(get_db)
+):
     session_id = str(uuid.uuid4())
-    agent = VoiceAgentService(db)
+    agent = VoiceAgentService(db, patient_id=patient_id)  # ← Pass it
     sessions[session_id] = agent
     result = await agent.chat("Hello, I just connected to VoiceCare.")
     return {"session_id": session_id, "greeting": result["response"]}
@@ -31,7 +34,11 @@ async def text_chat(data: ChatRequest, db: AsyncSession = Depends(get_db)):
     return {"session_id": data.session_id, "response": result["response"]}
 
 @router.post("/voice-chat")
-async def voice_chat(session_id: str, audio: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def voice_chat(
+    session_id: str,
+    audio: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db)
+):
     audio_bytes = await audio.read()
     user_text = await transcribe_audio(audio_bytes)
     agent = sessions.get(session_id)
