@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database.db import get_db
@@ -48,7 +48,6 @@ async def get_available_slots(data: SlotRequest, db: AsyncSession = Depends(get_
 
 @router.post("/", response_model=AppointmentOut, status_code=201)
 async def book_appointment(data: AppointmentCreate, db: AsyncSession = Depends(get_db)):
-    # Check for duplicate booking
     existing = await db.execute(
         select(Appointment).where(
             Appointment.doctor_id == data.doctor_id,
@@ -60,12 +59,39 @@ async def book_appointment(data: AppointmentCreate, db: AsyncSession = Depends(g
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Slot already booked")
 
-    appt = Appointment(**data.model_dump(), appointment_id=gen_appt_id())
+    appt = Appointment(**data.model_dump(), appointment_id=gen_appt_id(), status="pending")
     db.add(appt)
     await db.commit()
     await db.refresh(appt)
     return appt
 
+# ✅ IMPORTANT: patient-approve MUST come BEFORE /{appt_id}
+@router.patch("/patient-approve/{appt_id}")
+async def patient_approve_appointment(
+    appt_id: int,
+    action: str = Query(..., description="'approve' or 'reject'"),
+    db: AsyncSession = Depends(get_db)
+):
+    appt = await db.get(Appointment, appt_id)
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    if action == "approve":
+        appt.status = "confirmed"
+    elif action == "reject":
+        appt.status = "cancelled"
+    else:
+        raise HTTPException(status_code=400, detail="Action must be 'approve' or 'reject'")
+
+    await db.commit()
+    await db.refresh(appt)
+    return {
+        "message": f"Appointment {action}d successfully",
+        "status": appt.status,
+        "appointment_id": appt.appointment_id
+    }
+
+# ✅ Generic /{appt_id} comes LAST
 @router.patch("/{appt_id}", response_model=AppointmentOut)
 async def update_appointment(appt_id: int, data: AppointmentUpdate, db: AsyncSession = Depends(get_db)):
     appt = await db.get(Appointment, appt_id)

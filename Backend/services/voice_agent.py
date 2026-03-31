@@ -1,20 +1,22 @@
 import json
 import os
-from openai import AsyncOpenAI
+import random
+from datetime import date  
+from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from models.patient import Patient
 from models.doctor import Doctor
 from models.appointment import Appointment
 from models.insurance_model import InsuranceRecord
-import os
-import json
-from groq import AsyncGroq
-from dotenv import load_dotenv
+from groq import AsyncGroq, AsyncClient
+import httpx
 
 load_dotenv()
-client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-
+client = AsyncGroq(
+    api_key=os.getenv("GROQ_API_KEY"),
+    http_client=httpx.AsyncClient(timeout=30.0)   # ← ADD timeout
+)
 SYSTEM_PROMPT = """You are VoiceCare AI, a friendly medical assistant for a clinic.
 You help patients:
 1. Book doctor appointments
@@ -113,9 +115,19 @@ TOOLS = [
 
 
 class VoiceAgentService:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, patient_id: int = None):
         self.db = db
-        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.patient_id = patient_id
+
+        patient_context = ""
+        if patient_id:
+            patient_context = (
+                f"\n\nIMPORTANT: The logged-in patient's database ID is {patient_id}. "
+                f"When calling book_appointment, ALWAYS use patient_id={patient_id}. "
+                f"Do NOT look up the patient ID — use {patient_id} directly."
+            )
+
+        self.history = [{"role": "system", "content": SYSTEM_PROMPT + patient_context}]
 
     async def _run_tool(self, name: str, args: dict) -> str:
         try:
@@ -123,18 +135,23 @@ class VoiceAgentService:
                 q = args["query"]
                 result = await self.db.execute(
                     select(Patient).where(
-                        or_(Patient.full_name.ilike(f"%{q}%"),
+                        or_(
+                            Patient.full_name.ilike(f"%{q}%"),
                             Patient.phone.ilike(f"%{q}%"),
-                            Patient.patient_id.ilike(f"%{q}%"))
+                            Patient.patient_id.ilike(f"%{q}%")
+                        )
                     )
                 )
                 patients = result.scalars().all()
                 if not patients:
                     return json.dumps({"found": False, "message": "No patient found"})
                 return json.dumps([{
-                    "id": p.id, "patient_id": p.patient_id,
-                    "name": p.full_name, "phone": p.phone,
-                    "dob": str(p.date_of_birth), "blood_group": p.blood_group
+                    "id": p.id,
+                    "patient_id": p.patient_id,
+                    "name": p.full_name,
+                    "phone": p.phone,
+                    "dob": str(p.date_of_birth),
+                    "blood_group": p.blood_group
                 } for p in patients])
 
             elif name == "get_doctors":
@@ -145,21 +162,24 @@ class VoiceAgentService:
                 result = await self.db.execute(query)
                 doctors = result.scalars().all()
                 return json.dumps([{
-                    "id": d.id, "doctor_id": d.doctor_id, "name": d.full_name,
+                    "id": d.id,
+                    "doctor_id": d.doctor_id,
+                    "name": d.full_name,
                     "specialization": d.specialization,
                     "available_days": d.available_days,
-                    "fee": d.consultation_fee, "rating": d.rating
+                    "fee": d.consultation_fee,
+                    "rating": d.rating
                 } for d in doctors])
 
             elif name == "get_available_slots":
                 doctor_id = args["doctor_id"]
-                appt_date = date.fromisoformat(args["date"])
+                appt_date = date.fromisoformat(args["date"])   # ← now works
                 doctor = await self.db.get(Doctor, doctor_id)
                 if not doctor:
                     return json.dumps({"error": "Doctor not found"})
                 day = appt_date.strftime("%A")
                 if day not in (doctor.available_days or []):
-                    return json.dumps({"slots": [], "message": f"Not available on {day}"})
+                    return json.dumps({"slots": [], "message": f"Doctor not available on {day}"})
                 booked = await self.db.execute(
                     select(Appointment.appointment_time).where(
                         Appointment.doctor_id == doctor_id,
@@ -172,6 +192,9 @@ class VoiceAgentService:
                 return json.dumps({"slots": free, "doctor": doctor.full_name, "date": args["date"]})
 
             elif name == "book_appointment":
+                # Force use of logged-in patient_id if set
+                pid = self.patient_id if self.patient_id else args["patient_id"]
+
                 existing = await self.db.execute(
                     select(Appointment).where(
                         Appointment.doctor_id == args["doctor_id"],
@@ -182,9 +205,10 @@ class VoiceAgentService:
                 )
                 if existing.scalar_one_or_none():
                     return json.dumps({"success": False, "message": "Slot already taken"})
+
                 appt = Appointment(
-                    appointment_id=f"APT-{random.randint(100000,999999)}",
-                    patient_id=args["patient_id"],
+                    appointment_id=f"APT-{random.randint(100000, 999999)}",  # ← now works
+                    patient_id=pid,          # ← uses logged-in patient
                     doctor_id=args["doctor_id"],
                     appointment_date=date.fromisoformat(args["appointment_date"]),
                     appointment_time=args["appointment_time"],
@@ -199,6 +223,7 @@ class VoiceAgentService:
                 return json.dumps({
                     "success": True,
                     "appointment_id": appt.appointment_id,
+                    "patient_id": pid,
                     "doctor": doctor.full_name if doctor else "Unknown",
                     "date": args["appointment_date"],
                     "time": args["appointment_time"],
@@ -233,39 +258,72 @@ class VoiceAgentService:
 
     async def chat(self, user_message: str) -> dict:
         self.history.append({"role": "user", "content": user_message})
+        
+        if len(self.history) > 11:
+            self.history = [self.history[0]] + self.history[-10:]
 
-        # Agentic loop
-        while True:
-            response = await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",  # Free Groq model
-                messages=self.history,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.7
-            )
+        for iteration in range(6):
+            try:
+                response = await client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=self.history,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    parallel_tool_calls=False,   # ← ADD THIS — prevents XML wrapping bug
+                    temperature=0.1,
+                    max_tokens=2048,             # ← Lower from 4096, reduces hallucination
+                )
+            except Exception as e:
+                print(f"❌ Groq API error [{iteration}]: {type(e).__name__}: {e}")
+
+                # Fallback: plain chat without tools
+                try:
+                    r2 = await client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=self.history,
+                        temperature=0.3,
+                        max_tokens=512,
+                    )
+                    reply = r2.choices[0].message.content or "How can I help you today?"
+                except Exception as e2:
+                    print(f"❌ Fallback failed: {e2}")
+                    reply = "I'm having trouble right now. Please try again."
+                self.history.append({"role": "assistant", "content": reply})
+                return {"response": reply, "conversation_length": len(self.history)}
+
             msg = response.choices[0].message
 
             if msg.tool_calls:
                 self.history.append(msg)
                 for tc in msg.tool_calls:
-                    args = json.loads(tc.function.arguments)
-                    result = await self._run_tool(tc.function.name, args)
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        result = await self._run_tool(tc.function.name, args)
+                        print(f"✅ [{tc.function.name}] args={args} → {result[:150]}")
+                    except json.JSONDecodeError as e:
+                        result = json.dumps({"error": f"Bad JSON in tool args: {e}"})
+                        print(f"❌ [{tc.function.name}] JSON parse failed: {tc.function.arguments}")
+                    except Exception as e:
+                        result = json.dumps({"error": str(e)})
+                        print(f"❌ [{tc.function.name}] tool error: {e}")
                     self.history.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": result
                     })
             else:
-                reply = msg.content
+                reply = msg.content or "How can I help you today?"
                 self.history.append({"role": "assistant", "content": reply})
                 return {"response": reply, "conversation_length": len(self.history)}
 
+        return {
+            "response": "I've processed your request. Please check your appointments tab.",
+            "conversation_length": len(self.history)
+        }
 
 async def transcribe_audio(audio_bytes: bytes) -> str:
-    """Use Groq Whisper — free"""
+    """Groq Whisper — free transcription"""
     import io
-    from groq import AsyncGroq
-    client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
     audio_file = io.BytesIO(audio_bytes)
     audio_file.name = "recording.webm"
     transcript = await client.audio.transcriptions.create(
@@ -274,6 +332,7 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
     )
     return transcript.text
 
+
 async def text_to_speech(text: str) -> bytes:
-    """Placeholder — TTS handled in frontend browser"""
-    return text.encode("utf-8")  
+    """TTS handled in frontend browser via Web Speech API"""
+    return text.encode("utf-8")
